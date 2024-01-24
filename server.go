@@ -3,18 +3,23 @@ package main
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/ini.v1"
 )
 
 const maxLogFiles = 10
@@ -43,6 +48,24 @@ const (
 	colorReset   = "\033[0m"
 )
 
+type Config struct {
+	BindIP             string `ini:"bind_ip"`
+	Port               int    `ini:"port"`
+	SecretKey          string `ini:"secret_key"`
+	OAuthTokenURL      string `ini:"oauth_token_url"`
+	OAuthCheckTokenURL string `ini:"oauth_check_token_url"`
+	OAuthAuthorizeURL  string `ini:"oauth_authorize_url"`
+	ClientID           string `ini:"client_id"`
+	ClientSecret       string `ini:"client_secret"`
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode  int
+	length      int
+	wroteHeader bool // 新增字段，用于跟踪是否已经写入头部
+}
+
 func init() {
 	// 初始化 fileLogger，不包含颜色代码
 	logFile, err := os.OpenFile("server.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
@@ -58,22 +81,29 @@ func init() {
 }
 
 func main() {
-	var port string
-
-	flag.StringVar(&secretKey, "sk", "", "Secret key for authentication")
-	flag.StringVar(&port, "p", "8080", "Port to listen on")
-	flag.Parse()
-
-	// 如果没有提供 SecretKey，则生成一个
-	if secretKey == "" {
-		secretKey = generateSecretKey()
-		fmt.Printf("Using Generated Secret Key: %s\n", secretKey)
+	cfg, err := ini.Load("server.conf")
+	if err != nil {
+		consoleLogger.Fatal("Fail to read file: ", err)
 	}
 
-	consoleLogger.Printf(colorGreen+"Starting http file server on :%s\n"+colorReset, port)
+	var config Config
+	err = cfg.MapTo(&config)
+	if err != nil {
+		log.Fatal("Fail to map configuration: ", err)
+	}
 
-	http.HandleFunc("/", handler)
-	http.ListenAndServe(fmt.Sprintf(":%s", port), nil)
+	secretKey := config.SecretKey
+	if secretKey == "" {
+		secretKey = generateSecretKey()
+	}
+	consoleLogger.Printf("Using Generated Secret Key: "+colorGreen+"%s"+colorReset, secretKey)
+
+	port := strconv.Itoa(config.Port)
+	consoleLogger.Printf("Starting http file server on "+colorGreen+"%s:%s"+colorReset, config.BindIP, port)
+
+	http.HandleFunc("/", handler(config))
+	http.HandleFunc("/callback", callbackHandler(config))
+	http.ListenAndServe(fmt.Sprintf("%s:%s", config.BindIP, port), nil)
 
 }
 
@@ -128,32 +158,215 @@ func generateSecretKey() string {
 	return "sk-" + string(b)
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	if errMsg := checkSecretKey(r); errMsg != "" {
-		sendJSONResponse(w, http.StatusForbidden, map[string]interface{}{"status": http.StatusForbidden, "error": errMsg})
-		return
-	}
+func handler(config Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
-	switch r.Method {
-	case "PUT":
-		uploadFile(w, r)
-	case "GET":
-		downloadFile(w, r)
-	case "DELETE":
-		deleteFile(w, r)
-	default:
-		http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
+		if !checkSecretKey(r) {
+			if !checkAccessToken(r, config) {
+				// sendJSONResponse(w, http.StatusForbidden, map[string]interface{}{"code": http.StatusForbidden, "error": "Access denied: invalid X-Access-Token in http header, or the 'X-Secret-Key' header is missing."})
+				// return
+				// 发送一个重定向响应
+				redirectURL := config.OAuthAuthorizeURL + "?client_id=" + config.ClientID + "&response_type=code&redirect_uri=" + "http://" + config.BindIP + ":" + strconv.Itoa(config.Port) + "/callback"
+				http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+				return
+			}
+		}
+		start := time.Now()
+		lrw := NewLoggingResponseWriter(w)
+
+		switch r.Method {
+		case "PUT":
+			uploadFile(w, r)
+		case "GET":
+			downloadFile(w, r)
+		case "DELETE":
+			deleteFile(w, r)
+		default:
+			http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
+		}
+
+		duration := time.Since(start)
+		method := coloredMethod(r.Method)
+		// 从 r.RemoteAddr 中提取 IP 地址
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// 如果无法解析 IP 地址，使用原始的 RemoteAddr
+			ip = r.RemoteAddr
+		}
+
+		consoleLogger.Printf("%s [%s] %s %d %d %d\n",
+			colorCyan+ip+colorReset, method, colorYellow+r.URL.Path+colorReset, http.StatusOK, duration.Milliseconds(), lrw.length)
 	}
 }
 
-func checkSecretKey(r *http.Request) string {
+func NewLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
+	return &loggingResponseWriter{w, http.StatusOK, 0, false}
+}
+
+func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
+	if !lrw.wroteHeader {
+		lrw.WriteHeader(http.StatusOK)
+	}
+	size, err := lrw.ResponseWriter.Write(b)
+	lrw.length += size
+	return size, err
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(statusCode int) {
+	if lrw.wroteHeader {
+		return // 如果头部已经写入，直接返回
+	}
+	lrw.ResponseWriter.WriteHeader(statusCode)
+	lrw.statusCode = statusCode
+	lrw.wroteHeader = true // 设置标志，表示头部已经写入
+}
+
+func coloredMethod(method string) string {
+	uppercaseMethod := strings.ToUpper(method)
+
+	switch uppercaseMethod {
+	case "GET":
+		return colorBlue + uppercaseMethod + colorReset
+	case "POST":
+		return colorGreen + uppercaseMethod + colorReset
+	case "PUT":
+		return colorYellow + uppercaseMethod + colorReset
+	case "DELETE":
+		return colorRed + uppercaseMethod + colorReset
+	default:
+		return colorMagenta + uppercaseMethod + colorReset
+	}
+}
+
+func callbackHandler(config Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			// 处理错误情况：缺少授权码
+			http.Error(w, "Authorization code is missing", http.StatusBadRequest)
+			return
+		}
+
+		// 请求 Access Token
+		token, err := requestAccessToken(code, config)
+		if err != nil {
+			// 处理错误情况：无法获取 Access Token
+			consoleLogger.Printf("An error occurred: %v\n", err)
+			http.Error(w, "Failed to get access token", http.StatusInternalServerError)
+			return
+		}
+
+		// 将 Access Token 设置到 Cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:  "access_token",
+			Value: token,
+			Path:  "/",
+		})
+
+		// 重定向到主页
+		http.Redirect(w, r, "http://"+config.BindIP+":"+strconv.Itoa(config.Port), http.StatusSeeOther)
+	}
+}
+func requestAccessToken(code string, config Config) (string, error) {
+	// 构建请求
+	req, err := http.NewRequest("POST", config.OAuthTokenURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	query := req.URL.Query()
+	query.Add("client_id", "sso")
+	query.Add("client_secret", "sso-secret")
+	query.Add("grant_type", "authorization_code")
+	query.Add("redirect_uri", "http://"+config.BindIP+":"+strconv.Itoa(config.Port)+"/callback")
+	query.Add("code", code)
+	req.URL.RawQuery = query.Encode()
+
+	println(req.URL.String())
+	// 发送请求
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// 解析响应以获取 Access Token
+	var result struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	return result.AccessToken, nil
+}
+
+func checkSecretKey(r *http.Request) bool {
 	// 从 HTTP 头部或查询参数中获取密钥
 	key := r.Header.Get("X-Secret-Key")
 
 	if key == "" || key != secretKey {
-		return "Access Denied: The 'X-Secret-Key' header is missing or contains an invalid value in the HTTP request"
+		return false
 	}
-	return ""
+	return true
+}
+
+func checkAccessToken(r *http.Request, config Config) bool {
+	// 尝试从 URL 查询参数获取 token
+	token := r.URL.Query().Get("token")
+
+	// 如果 URL 中没有 token，尝试从 HTTP 头部获取
+	if token == "" {
+		token = r.Header.Get("X-Access-Token")
+	}
+
+	// 如果 HTTP 头部中也没有 token，尝试从 Cookie 获取
+	if token == "" {
+		cookie, err := r.Cookie("access_token")
+		if err == nil {
+			token = cookie.Value
+		}
+	}
+
+	return validateTokenWithExternalService(token, config)
+}
+
+func validateTokenWithExternalService(token string, config Config) bool {
+	req, err := http.NewRequest("POST", config.OAuthCheckTokenURL, nil)
+	if err != nil {
+		return false
+	}
+
+	query := req.URL.Query()
+	query.Add("token", token)
+	req.URL.RawQuery = query.Encode()
+
+	// 对 client_id:client_secret 进行 Base64 编码
+	auth := config.ClientID + ":" + config.ClientSecret
+	encodedAuth := base64.StdEncoding.EncodeToString([]byte(auth))
+
+	// 设置 HTTP Authorization Header
+	req.Header.Add("Authorization", "Basic "+encodedAuth)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body) // 读取响应体
+	if err != nil {
+		log.Fatal(err) // 或者用其他方式处理错误
+	}
+
+	consoleLogger.Printf("check_token: "+colorGreen+"%s"+colorReset, string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	return true
 }
 
 func uploadFile(w http.ResponseWriter, r *http.Request) {
@@ -206,6 +419,7 @@ func downloadFile(w http.ResponseWriter, r *http.Request) {
 	// Open file
 	file, err := os.Open(filePath)
 	if err != nil {
+		consoleLogger.Printf("Error opening file: %+v\n", filePath)
 		sendJSONResponse(w, http.StatusNotFound, createResponse(http.StatusNotFound, "File not found", "", 0, time.Time{}, time.Time{}))
 		return
 	}
