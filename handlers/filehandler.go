@@ -33,6 +33,17 @@ func SetConfig(c config.Config) {
 }
 
 func HandleMain(w http.ResponseWriter, r *http.Request) {
+	// 设置 CORS 头
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// 如果是预检请求，发送适当的头并结束响应
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Secret-Key")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if !checkSecretKey(r) {
 		if !checkAccessToken(r, cfg) {
 			// sendJSONResponse(w, http.StatusForbidden, map[string]interface{}{"code": http.StatusForbidden, "error": "Access denied: invalid X-Access-Token in http header, or the 'X-Secret-Key' header is missing."})

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>File Upload with PUT Method</title>
+    <script>
+      function handleFormSubmit(event) {
+        event.preventDefault() // 阻止表单的默认提交行为
+
+        var fileInput = document.getElementById('fileInput')
+        var file = fileInput.files[0]
+        var secretKey = document.getElementById('secretKey').value
+
+        var formData = new FormData()
+        formData.append('file', file)
+
+        fetch('http://192.168.51.14:8080/bucket-name/111.pdf', {
+          method: 'PUT',
+          headers: {
+            'X-Secret-Key': secretKey
+          },
+          body: formData
+        })
+          .then((response) => {
+            if (response.ok) {
+              alert('File uploaded successfully')
+            } else {
+              alert('Upload failed')
+            }
+          })
+          .catch((error) => {
+            console.error('Error:', error)
+          })
+      }
+    </script>
+  </head>
+  <body>
+    <h2>File Upload with PUT Method</h2>
+    <form onsubmit="handleFormSubmit(event)" enctype="multipart/form-data">
+      <input type="file" id="fileInput" name="file" required />
+      <input
+        type="text"
+        id="secretKey"
+        name="X-Secret-Key"
+        placeholder="Enter Secret Key"
+        value="sk-Zo6mugHQQqLSGXGIR6G0teFWj0tZpkFtF6bwTdrhYcyboSIB"
+        required
+      />
+      <button type="submit">Upload File</button>
+    </form>
+  </body>
+</html>
