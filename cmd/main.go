@@ -25,8 +25,10 @@ func main() {
 	secretKey := cfg.SecretKey
 	if secretKey == "" {
 		secretKey = util.GenerateSecretKey()
+		logging.ConsoleLogger.Printf("Using Secret Key: "+logging.ColorGreen+"%s"+logging.ColorReset, secretKey)
+	} else {
+		logging.ConsoleLogger.Printf("Using Secret Key in Config File: "+logging.ColorGreen+"%s"+logging.ColorReset, secretKey)
 	}
-	logging.ConsoleLogger.Printf("Using Generated Secret Key: "+logging.ColorGreen+"%s"+logging.ColorReset, secretKey)
 
 	// Setup HTTP server and routes
 	http.HandleFunc("/", handlers.HandleMain)
@@ -36,6 +38,9 @@ func main() {
 	port := strconv.Itoa(cfg.Port)
 	// Start the server
 	logging.ConsoleLogger.Printf("Starting http file server on "+logging.ColorGreen+"%s:%s"+logging.ColorReset, cfg.BindIP, port)
-	http.ListenAndServe(fmt.Sprintf("%s:%s", cfg.BindIP, port), nil)
+	err := http.ListenAndServe(fmt.Sprintf("%s:%s", cfg.BindIP, port), nil)
+	if err != nil {
+		logging.ConsoleLogger.Printf("Error starting http file server: "+logging.ColorRed+"%s"+logging.ColorReset, err)
+	}
 
 }

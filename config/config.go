@@ -7,6 +7,7 @@ import (
 )
 
 type Config struct {
+	DataDir            string `ini:"data_dir"`
 	BindIP             string `ini:"bind_ip"`
 	Port               int    `ini:"port"`
 	SecretKey          string `ini:"secret_key"`
